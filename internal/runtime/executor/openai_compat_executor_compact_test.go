@@ -70,6 +70,104 @@ func TestOpenAICompatExecutorStreamAddsKimiReasoningForAssistantToolCalls(t *tes
 	}
 }
 
+func TestOpenAICompatExecutorAddsReasoningHistoryForThinkingModels(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"deepseek-v3","choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"fresh reasoning"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v3",
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"previous answer"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	reasoning := gjson.GetBytes(gotBody, "messages.1.reasoning_content")
+	if !reasoning.Exists() {
+		t.Fatalf("messages.1.reasoning_content should exist in upstream body: %s", string(gotBody))
+	}
+	if got := reasoning.String(); got != "previous answer" {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "previous answer")
+	}
+}
+
+func TestOpenAICompatExecutorStreamAddsReasoningHistoryForThinkingModels(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"xiaomi-mi-thinking",
+		"reasoning_effort":"medium",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"prior step"},
+			{"role":"user","content":"next"}
+		]
+	}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "xiaomi-mi-thinking",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for range result.Chunks {
+	}
+
+	reasoning := gjson.GetBytes(gotBody, "messages.1.reasoning_content")
+	if !reasoning.Exists() {
+		t.Fatalf("messages.1.reasoning_content should exist in upstream body: %s", string(gotBody))
+	}
+	if got := reasoning.String(); got != "prior step" {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "prior step")
+	}
+}
+
 func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	var gotPath string
 	var gotBody []byte

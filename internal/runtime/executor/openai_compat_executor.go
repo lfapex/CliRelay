@@ -16,6 +16,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -102,7 +103,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
+	preThinkingTranslated := translated
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return resp, err
+	}
+	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated)
 	if err != nil {
 		return resp, err
 	}
@@ -207,7 +213,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
 
+	preThinkingTranslated := translated
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return nil, err
+	}
+	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated)
 	if err != nil {
 		return nil, err
 	}
@@ -397,6 +408,69 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) || (!compatThinkingEnabled(body) && !compatThinkingEnabled(original)) {
+		return body, nil
+	}
+
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, nil
+	}
+
+	out := body
+	patched := 0
+	latestReasoning := ""
+	hasLatestReasoning := false
+
+	for msgIdx, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+			continue
+		}
+
+		reasoning := msg.Get("reasoning_content")
+		if reasoning.Exists() && strings.TrimSpace(reasoning.String()) != "" {
+			latestReasoning = reasoning.String()
+			hasLatestReasoning = true
+			continue
+		}
+
+		reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
+		if strings.TrimSpace(reasoningText) == "" {
+			continue
+		}
+
+		path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
+		next, err := sjson.SetBytes(out, path, reasoningText)
+		if err != nil {
+			return body, fmt.Errorf("openai compat executor: failed to set assistant reasoning_content: %w", err)
+		}
+		out = next
+		latestReasoning = reasoningText
+		hasLatestReasoning = true
+		patched++
+	}
+
+	if patched > 0 {
+		log.WithField("patched_reasoning_messages", patched).Debug("openai compat executor: normalized reasoning history")
+	}
+
+	return out, nil
+}
+
+func compatThinkingEnabled(body []byte) bool {
+	if effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String())); effort != "" && effort != "none" {
+		return true
+	}
+	if effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String())); effort != "" && effort != "none" {
+		return true
+	}
+	if gjson.GetBytes(body, "chat_template_kwargs.enable_thinking").Bool() {
+		return true
+	}
+	return gjson.GetBytes(body, "reasoning_split").Bool()
 }
 
 func shouldNormalizeKimiCompatPayload(model string) bool {

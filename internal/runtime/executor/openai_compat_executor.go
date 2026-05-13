@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -152,7 +153,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newOpenAICompatHTTPClient(ctx, e.cfg, auth, baseURL)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -185,6 +186,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// Translate response back to source format when needed
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+	if shouldHideCompatReasoningContent(e.resolveCompatConfig(auth), auth, baseModel) {
+		out = stripReasoningContentFromOpenAIResponse([]byte(out), false)
+	}
 	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -264,7 +268,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newOpenAICompatHTTPClient(ctx, e.cfg, auth, baseURL)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -314,7 +318,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// Pass through translator; it yields one or more chunks for the target schema.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				chunkPayload := chunks[i]
+				if shouldHideCompatReasoningContent(e.resolveCompatConfig(auth), auth, baseModel) {
+					chunkPayload = stripReasoningContentFromOpenAIResponse([]byte(chunkPayload), true)
+				}
+				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunkPayload)}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
@@ -410,8 +418,101 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	return payload
 }
 
+func newOpenAICompatHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, baseURL string) *http.Client {
+	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	if !shouldUseExtendedCompatResponseTimeout(baseURL) {
+		return httpClient
+	}
+
+	if transport, ok := httpClient.Transport.(*http.Transport); ok && transport != nil {
+		cloned := transport.Clone()
+		cloned.ResponseHeaderTimeout = 90 * time.Second
+		httpClient.Transport = cloned
+	}
+	return httpClient
+}
+
+func shouldUseExtendedCompatResponseTimeout(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "integrate.api.nvidia.com"
+}
+
+func shouldHideCompatReasoningContent(compat *config.OpenAICompatibility, auth *cliproxyauth.Auth, model string) bool {
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if strings.HasPrefix(model, "mimo-") {
+		return true
+	}
+	if compat != nil {
+		name := strings.ToLower(strings.TrimSpace(compat.Name))
+		if name == "xiaomi" {
+			return true
+		}
+		baseURL := strings.ToLower(strings.TrimSpace(compat.BaseURL))
+		if strings.Contains(baseURL, "xiaomi") {
+			return true
+		}
+	}
+	if auth != nil {
+		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["compat_name"])); v == "xiaomi" {
+			return true
+		}
+		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["provider_key"])); v == "xiaomi" {
+			return true
+		}
+	}
+	return false
+}
+
+func stripReasoningContentFromOpenAIResponse(payload []byte, stream bool) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if stream {
+		line := string(payload)
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data:") {
+			if !gjson.Valid(trimmed) {
+				return line
+			}
+			return string(stripReasoningContentFields([]byte(trimmed)))
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+		if data == "" || data == "[DONE]" || !gjson.Valid(data) {
+			return line
+		}
+		sanitized := stripReasoningContentFields([]byte(data))
+		prefix := line[:strings.Index(line, "data:")]
+		return prefix + "data: " + string(sanitized) + "\n\n"
+	}
+	if !gjson.ValidBytes(payload) {
+		return string(payload)
+	}
+	return string(stripReasoningContentFields(payload))
+}
+
+func stripReasoningContentFields(payload []byte) []byte {
+	out := payload
+	choices := gjson.GetBytes(payload, "choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return out
+	}
+	for idx := range choices.Array() {
+		if updated, err := sjson.DeleteBytes(out, fmt.Sprintf("choices.%d.delta.reasoning_content", idx)); err == nil {
+			out = updated
+		}
+		if updated, err := sjson.DeleteBytes(out, fmt.Sprintf("choices.%d.message.reasoning_content", idx)); err == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
 func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) || (!compatThinkingEnabled(body) && !compatThinkingEnabled(original)) {
+	if len(body) == 0 || !gjson.ValidBytes(body) || !shouldNormalizeCompatReasoningHistory(body, original) {
 		return body, nil
 	}
 
@@ -422,6 +523,8 @@ func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, erro
 
 	out := body
 	patched := 0
+	assistantMessages := 0
+	missingReasoning := 0
 	latestReasoning := ""
 	hasLatestReasoning := false
 
@@ -429,6 +532,7 @@ func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, erro
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
 			continue
 		}
+		assistantMessages++
 
 		reasoning := msg.Get("reasoning_content")
 		if reasoning.Exists() && strings.TrimSpace(reasoning.String()) != "" {
@@ -436,6 +540,7 @@ func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, erro
 			hasLatestReasoning = true
 			continue
 		}
+		missingReasoning++
 
 		reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
 		if strings.TrimSpace(reasoningText) == "" {
@@ -454,10 +559,21 @@ func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, erro
 	}
 
 	if patched > 0 {
-		log.WithField("patched_reasoning_messages", patched).Debug("openai compat executor: normalized reasoning history")
+		log.WithFields(log.Fields{
+			"assistant_messages":         assistantMessages,
+			"missing_reasoning_messages": missingReasoning,
+			"patched_reasoning_messages": patched,
+		}).Debug("openai compat executor: normalized reasoning history")
 	}
 
 	return out, nil
+}
+
+func shouldNormalizeCompatReasoningHistory(body []byte, original []byte) bool {
+	return compatThinkingEnabled(body) ||
+		compatThinkingEnabled(original) ||
+		compatHasAssistantReasoningHistory(body) ||
+		compatHasAssistantReasoningHistory(original)
 }
 
 func compatThinkingEnabled(body []byte) bool {
@@ -471,6 +587,25 @@ func compatThinkingEnabled(body []byte) bool {
 		return true
 	}
 	return gjson.GetBytes(body, "reasoning_split").Bool()
+}
+
+func compatHasAssistantReasoningHistory(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return false
+	}
+	for _, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+			continue
+		}
+		if strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldNormalizeKimiCompatPayload(model string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,7 +186,7 @@ func TestRequestExecutionMetadata_UsesPathRouteContextFromRequestContext(t *test
 	ctx := internalrouting.WithPathRouteContext(context.Background(), route)
 	ctx = context.WithValue(ctx, util.ContextKeyGin, ginCtx)
 
-	meta := requestExecutionMetadata(ctx)
+	meta := requestExecutionMetadata(ctx, "gpt-5")
 	if got := meta["route_group"]; got != "pro" {
 		t.Fatalf("route_group = %v, want %q", got, "pro")
 	}
@@ -209,11 +210,79 @@ func TestRequestExecutionMetadata_UsesGinRequestContextPathRouteAfterHandleConte
 	ginCtx.Request = req
 
 	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
-	meta := requestExecutionMetadata(ctx)
+	meta := requestExecutionMetadata(ctx, "gpt-5")
 	if got := meta["route_group"]; got != "pro" {
 		t.Fatalf("route_group = %v, want %q", got, "pro")
 	}
 	if got := meta["route_fallback"]; got != "none" {
 		t.Fatalf("route_fallback = %v, want %q", got, "none")
+	}
+}
+
+func TestRequestExecutionMetadata_ExtractsSessionAffinityKeyFromHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	req.Header.Set("X-Session-ID", "session-42")
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx, "gpt-5")
+	if got := meta["session_affinity_key"]; got != "session-42" {
+		t.Fatalf("session_affinity_key = %v, want %q", got, "session-42")
+	}
+}
+
+func TestRequestExecutionMetadata_FallsBackToExecutionSessionIDForAffinity(t *testing.T) {
+	meta := requestExecutionMetadata(WithExecutionSessionID(context.Background(), "exec-session-1"), "gpt-5")
+	if got := meta["session_affinity_key"]; got != "exec-session-1" {
+		t.Fatalf("session_affinity_key = %v, want %q", got, "exec-session-1")
+	}
+}
+
+func TestRequestExecutionMetadata_GeneratesFallbackSessionAffinityKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("User-Agent", "Hermes/1.0")
+	req.RemoteAddr = "203.0.113.10:4567"
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx, "gpt-5")
+	got, _ := meta["session_affinity_key"].(string)
+	if got == "" {
+		t.Fatal("expected fallback session_affinity_key to be generated")
+	}
+	if !strings.HasPrefix(got, "fallback:") {
+		t.Fatalf("session_affinity_key = %q, want fallback prefix", got)
+	}
+
+	meta2 := requestExecutionMetadata(ctx, "gpt-5")
+	got2, _ := meta2["session_affinity_key"].(string)
+	if got != got2 {
+		t.Fatalf("expected stable fallback session key, got %q then %q", got, got2)
+	}
+}
+
+func TestRequestExecutionMetadata_DoesNotOverrideExplicitSessionAffinityHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Session-ID", "sticky-42")
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx, "gpt-5")
+	if got := meta["session_affinity_key"]; got != "sticky-42" {
+		t.Fatalf("session_affinity_key = %v, want %q", got, "sticky-42")
 	}
 }

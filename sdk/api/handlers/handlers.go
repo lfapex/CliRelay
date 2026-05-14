@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,7 +222,7 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
-func requestExecutionMetadata(ctx context.Context) map[string]any {
+func requestExecutionMetadata(ctx context.Context, requestedModel string) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
@@ -229,6 +230,7 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	allowedChannelGroups := ""
 	routeGroup := ""
 	routeFallback := ""
+	sessionKey := ""
 	if route := internalrouting.PathRouteContextFromContext(ctx); route != nil {
 		routeGroup = strings.TrimSpace(route.Group)
 		routeFallback = strings.TrimSpace(route.Fallback)
@@ -236,6 +238,7 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value(util.ContextKeyGin).(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			sessionKey = sessionAffinityKeyFromRequest(ginCtx.Request)
 			if metadataVal, exists := ginCtx.Get("accessMetadata"); exists {
 				if metadata, okMeta := metadataVal.(map[string]string); okMeta {
 					allowedChannels = strings.TrimSpace(metadata["allowed-channels"])
@@ -277,6 +280,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if routeFallback != "" {
 		meta[coreexecutor.RouteFallbackMetadataKey] = routeFallback
 	}
+	if sessionKey != "" {
+		meta[coreexecutor.SessionAffinityMetadataKey] = sessionKey
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -285,8 +291,65 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
+		if sessionKey == "" {
+			meta[coreexecutor.SessionAffinityMetadataKey] = executionSessionID
+		}
+	}
+	if _, ok := meta[coreexecutor.SessionAffinityMetadataKey]; !ok {
+		if fallbackKey := fallbackSessionAffinityKeyFromContext(ctx, requestedModel, routeGroup); fallbackKey != "" {
+			meta[coreexecutor.SessionAffinityMetadataKey] = fallbackKey
+		}
 	}
 	return meta
+}
+
+func sessionAffinityKeyFromRequest(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	for _, name := range []string{
+		"X-Session-ID",
+		"Session-ID",
+		"X-Conversation-ID",
+		"Conversation-ID",
+	} {
+		if value := strings.TrimSpace(req.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func fallbackSessionAffinityKeyFromContext(ctx context.Context, requestedModel string, routeGroup string) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value(util.ContextKeyGin).(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	req := ginCtx.Request
+	authHeader := strings.TrimSpace(req.Header.Get("Authorization"))
+	apiKeyHeader := strings.TrimSpace(req.Header.Get("X-API-Key"))
+	if authHeader == "" && apiKeyHeader == "" {
+		return ""
+	}
+	userAgent := strings.TrimSpace(req.UserAgent())
+	clientIP := strings.TrimSpace(ginCtx.ClientIP())
+	requestedModel = strings.TrimSpace(requestedModel)
+	routeGroup = strings.TrimSpace(routeGroup)
+	path := strings.TrimSpace(req.URL.Path)
+	fingerprint := strings.Join([]string{
+		authHeader,
+		apiKeyHeader,
+		userAgent,
+		clientIP,
+		path,
+		routeGroup,
+		requestedModel,
+	}, "\n")
+	sum := sha256.Sum256([]byte(fingerprint))
+	return fmt.Sprintf("fallback:%x", sum[:12])
 }
 
 func isGroupedRouteRequestMeta(meta map[string]any) bool {
@@ -617,7 +680,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, normalizedModel)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -665,7 +728,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, normalizedModel)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -717,7 +780,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, normalizedModel)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	groupedRoute := isGroupedRouteRequestMeta(reqMeta)
 	payload := rawJSON

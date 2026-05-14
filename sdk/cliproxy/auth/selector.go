@@ -372,11 +372,29 @@ func weightedSelectionScope(meta map[string]any) string {
 }
 
 func isWeightedPrioritySelection(meta map[string]any) bool {
-	return weightedSelectionScope(meta) != ""
+	if weightedSelectionScope(meta) != "" {
+		return true
+	}
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[cliproxyexecutor.ForceWeightedSelectionMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		return err == nil && parsed
+	default:
+		return false
+	}
 }
 
 func authSelectionWeight(auth *Auth) int {
-	weight, ok := authPriorityValue(auth)
+	weight, ok := authSelectionWeightValue(auth)
 	if !ok {
 		return 1
 	}
@@ -384,6 +402,30 @@ func authSelectionWeight(auth *Auth) int {
 		return 0
 	}
 	return weight
+}
+
+func authSelectionWeightValue(auth *Auth) (int, bool) {
+	if auth == nil {
+		return 0, false
+	}
+	if auth.Attributes != nil {
+		for _, key := range []string{"weight", "priority"} {
+			if raw := strings.TrimSpace(auth.Attributes[key]); raw != "" {
+				parsed, err := strconv.Atoi(raw)
+				if err == nil {
+					return parsed, true
+				}
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"weight", "priority"} {
+			if parsed, ok := parseIntAny(auth.Metadata[key]); ok {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, includeAllPriorities bool) ([]*Auth, error) {

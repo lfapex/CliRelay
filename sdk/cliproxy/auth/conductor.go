@@ -122,6 +122,8 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
+	// SessionKey carries the conversation affinity key when present.
+	SessionKey string
 }
 
 // Selector chooses an auth candidate for execution.
@@ -186,6 +188,11 @@ type Manager struct {
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
 	quotaProbeAfter  map[string]time.Time
+
+	loadMu          sync.Mutex
+	authLoads       map[string]*authLoadState
+	authExperience  map[string]*authExperienceState
+	sessionBindings map[string]sessionBinding
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -215,10 +222,14 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:    make(map[string]int),
 		refreshSemaphore:   make(chan struct{}, refreshMaxConcurrency),
 		quotaProbeAfter:    make(map[string]time.Time),
+		authLoads:          make(map[string]*authLoadState),
+		authExperience:     make(map[string]*authExperienceState),
+		sessionBindings:    make(map[string]sessionBinding),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
+	registerAuthLoadManager(manager)
 	return manager
 }
 
@@ -698,6 +709,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	singlePickRoute := isSinglePickRouteRequest(opts.Metadata)
+	sessionKey := sessionAffinityKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -714,17 +726,20 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		m.beginAuthRequest(auth.ID, time.Now())
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
+		execCtx = withRequestStreamingContext(execCtx, false)
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
 		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+		m.finishAuthRequest(auth.ID)
+		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil, SessionKey: sessionKey}
 		if errExec != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -755,6 +770,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	singlePickRoute := isSinglePickRouteRequest(opts.Metadata)
+	sessionKey := sessionAffinityKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -771,16 +787,19 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		m.beginAuthRequest(auth.ID, time.Now())
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
+		execCtx = withRequestStreamingContext(execCtx, false)
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
 		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+		m.finishAuthRequest(auth.ID)
 		if errExec != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -794,6 +813,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			lastErr = errExec
 			continue
 		}
+		m.rememberSessionAffinity(opts.Metadata, routeModel, auth.ID, time.Now())
+		m.hook.OnResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true, SessionKey: sessionKey})
 		return resp, nil
 	}
 }
@@ -805,6 +826,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	singlePickRoute := isSinglePickRouteRequest(opts.Metadata)
+	sessionKey := sessionAffinityKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -821,22 +843,25 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		m.beginAuthRequest(auth.ID, time.Now())
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
+		execCtx = withRequestStreamingContext(execCtx, true)
 		execReq := req
 		execReq.Model = rewriteModelForAuth(routeModel, auth)
 		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
+			m.finishAuthRequest(auth.ID)
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
 			rerr := errorFromExecution(errStream)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr, SessionKey: sessionKey}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(execCtx, result)
 			if isRequestInvalidError(errStream) {
@@ -851,29 +876,37 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		out := make(chan cliproxyexecutor.StreamChunk)
 		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
 			defer close(out)
+			defer m.finishAuthRequest(streamAuth.ID)
 			var failed bool
+			var sawPayload bool
 			forward := true
 			for chunk := range streamChunks {
 				if chunk.Err != nil && !failed {
 					failed = true
 					rerr := errorFromExecution(chunk.Err)
-					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: false, Error: rerr})
+					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: false, Error: rerr, SessionKey: sessionKey})
 				}
 				if !forward {
 					continue
 				}
 				if streamCtx == nil {
 					out <- chunk
+					if len(chunk.Payload) > 0 {
+						sawPayload = true
+					}
 					continue
 				}
 				select {
 				case <-streamCtx.Done():
 					forward = false
 				case out <- chunk:
+					if len(chunk.Payload) > 0 {
+						sawPayload = true
+					}
 				}
 			}
-			if !failed {
-				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
+			if !failed && sawPayload {
+				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true, SessionKey: sessionKey})
 			}
 		}(execCtx, auth.Clone(), provider, streamResult.Chunks)
 		return &cliproxyexecutor.StreamResult{
@@ -1430,6 +1463,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	now := time.Now()
+	if result.Success {
+		m.rememberSessionAffinity(map[string]any{
+			cliproxyexecutor.SessionAffinityMetadataKey: result.SessionKey,
+			cliproxyexecutor.RequestedModelMetadataKey:  result.Model,
+		}, result.Model, result.AuthID, now)
+	} else if statusCodeFromResult(result.Error) == 429 {
+		m.recordAuth429(result.AuthID, now)
+	}
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -1439,8 +1481,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
-		now := time.Now()
-
 		if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
@@ -2081,6 +2121,22 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	now := time.Now()
+	if sticky := m.findStickyCandidate(candidates, opts.Metadata, model, now); sticky != nil && pinnedAuthID == "" {
+		authCopy := sticky.Clone()
+		m.mu.RUnlock()
+		if !sticky.indexAssigned {
+			m.mu.Lock()
+			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+				current.EnsureIndex()
+				authCopy = current.Clone()
+			}
+			m.mu.Unlock()
+		}
+		return authCopy, executor, nil
+	}
+	candidates = m.filterCandidatesByLoad(candidates, pinnedAuthID != "", now)
+	candidates, opts = m.prepareCandidatesForSelection(candidates, opts)
 	selector := m.selectorForRoutingScopeLocked(cfg, routeGroup, allowedGroups)
 	selected, errPick := selector.Pick(ctx, provider, model, opts, candidates)
 	if errPick != nil {
@@ -2184,6 +2240,28 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	now := time.Now()
+	if sticky := m.findStickyCandidate(candidates, opts.Metadata, model, now); sticky != nil && pinnedAuthID == "" {
+		providerKey := strings.TrimSpace(strings.ToLower(sticky.Provider))
+		executor, okExecutor := m.executors[providerKey]
+		if !okExecutor {
+			m.mu.RUnlock()
+			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		authCopy := sticky.Clone()
+		m.mu.RUnlock()
+		if !sticky.indexAssigned {
+			m.mu.Lock()
+			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+				current.EnsureIndex()
+				authCopy = current.Clone()
+			}
+			m.mu.Unlock()
+		}
+		return authCopy, executor, providerKey, nil
+	}
+	candidates = m.filterCandidatesByLoad(candidates, pinnedAuthID != "", now)
+	candidates, opts = m.prepareCandidatesForSelection(candidates, opts)
 	selector := m.selectorForRoutingScopeLocked(cfg, routeGroup, allowedGroups)
 	selected, errPick := selector.Pick(ctx, "mixed", model, opts, candidates)
 	if errPick != nil {

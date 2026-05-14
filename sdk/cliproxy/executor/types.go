@@ -13,6 +13,11 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// SessionAffinityMetadataKey carries a stable conversation/session key used
+	// to prefer the previously successful upstream auth for follow-up turns.
+	SessionAffinityMetadataKey = "session_affinity_key"
+	// ForceWeightedSelectionMetadataKey forces weighted round-robin selection.
+	ForceWeightedSelectionMetadataKey = "force_weighted_selection"
 	// SinglePickMetadataKey forces the auth manager to use exactly one picked auth
 	// for the request and return its error directly without internal retry/fallback.
 	SinglePickMetadataKey = "single_pick"

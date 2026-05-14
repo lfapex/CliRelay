@@ -218,6 +218,76 @@ func TestOpenAICompatExecutorAddsReasoningHistoryWhenConversationAlreadyContains
 	}
 }
 
+func TestOpenAICompatExecutorRestoresHiddenXiaomiReasoningForToolContinuation(t *testing.T) {
+	var gotBodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		gotBodies = append(gotBodies, body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(gotBodies) == 1 {
+			_, _ = w.Write([]byte("data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mimo-v2.5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"need tool inspection\",\"tool_calls\":null},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mimo-v2.5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{}\"}}],\"reasoning_content\":null},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mimo-v2.5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":     server.URL + "/v1",
+		"api_key":      "test",
+		"compat_name":  "xiaomi",
+		"provider_key": "xiaomi",
+	}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.SessionAffinityMetadataKey: "session-xiaomi-reasoning",
+		},
+	}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "mimo-v2.5",
+		Payload: []byte(`{"model":"mimo-v2.5","messages":[{"role":"user","content":"check config"}]}`),
+	}, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream first error: %v", err)
+	}
+	for range result.Chunks {
+	}
+
+	result, err = executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "mimo-v2.5",
+		Payload: []byte(`{
+			"model":"mimo-v2.5",
+			"messages":[
+				{"role":"user","content":"check config"},
+				{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"terminal","arguments":"{}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"{\"output\":\"ok\",\"exit_code\":0,\"error\":null}"}
+			]
+		}`),
+	}, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream second error: %v", err)
+	}
+	for range result.Chunks {
+	}
+
+	if len(gotBodies) != 2 {
+		t.Fatalf("got %d upstream requests, want 2", len(gotBodies))
+	}
+	if got := gjson.GetBytes(gotBodies[1], "messages.1.reasoning_content").String(); got != "need tool inspection" {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q; body=%s", got, "need tool inspection", string(gotBodies[1]))
+	}
+}
+
 func TestOpenAICompatExecutorStripsXiaomiReasoningContentNonStream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

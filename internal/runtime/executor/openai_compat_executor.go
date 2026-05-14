@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -28,6 +29,8 @@ type OpenAICompatExecutor struct {
 	provider string
 	cfg      *config.Config
 }
+
+var compatReasoningHistoryCache sync.Map
 
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
 func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatExecutor {
@@ -109,7 +112,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated)
+	sessionKey := compatReasoningSessionKey(opts.Metadata, baseModel)
+	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated, compatReasoningLookup(sessionKey))
 	if err != nil {
 		return resp, err
 	}
@@ -180,6 +184,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, body)
+	compatReasoningRemember(sessionKey, extractLatestReasoningContent(body, false))
 	reporter.publishWithContent(ctx, parseOpenAIUsage(body), string(req.Payload), string(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.ensurePublished(ctx)
@@ -222,7 +227,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
-	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated)
+	sessionKey := compatReasoningSessionKey(opts.Metadata, baseModel)
+	translated, err = normalizeCompatReasoningHistory(translated, preThinkingTranslated, compatReasoningLookup(sessionKey))
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +308,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
+			compatReasoningAppend(sessionKey, extractLatestReasoningContent(line, true))
 			reporter.appendOutputChunk(line)
 			if detail, ok := parseOpenAIStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
@@ -511,9 +518,11 @@ func stripReasoningContentFields(payload []byte) []byte {
 	return out
 }
 
-func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, error) {
+func normalizeCompatReasoningHistory(body []byte, original []byte, cachedReasoning string) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) || !shouldNormalizeCompatReasoningHistory(body, original) {
-		return body, nil
+		if strings.TrimSpace(cachedReasoning) == "" || !shouldBackfillCompatReasoningFromCache(body) {
+			return body, nil
+		}
 	}
 
 	messages := gjson.GetBytes(body, "messages")
@@ -525,8 +534,8 @@ func normalizeCompatReasoningHistory(body []byte, original []byte) ([]byte, erro
 	patched := 0
 	assistantMessages := 0
 	missingReasoning := 0
-	latestReasoning := ""
-	hasLatestReasoning := false
+	latestReasoning := strings.TrimSpace(cachedReasoning)
+	hasLatestReasoning := latestReasoning != ""
 
 	for msgIdx, msg := range messages.Array() {
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
@@ -576,6 +585,29 @@ func shouldNormalizeCompatReasoningHistory(body []byte, original []byte) bool {
 		compatHasAssistantReasoningHistory(original)
 }
 
+func shouldBackfillCompatReasoningFromCache(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return false
+	}
+	hasToolMessage := false
+	hasAssistantToolCalls := false
+	for _, msg := range messages.Array() {
+		switch strings.TrimSpace(msg.Get("role").String()) {
+		case "tool":
+			hasToolMessage = true
+		case "assistant":
+			if msg.Get("tool_calls").Exists() {
+				hasAssistantToolCalls = true
+			}
+		}
+	}
+	return hasToolMessage && hasAssistantToolCalls
+}
+
 func compatThinkingEnabled(body []byte) bool {
 	if effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String())); effort != "" && effort != "none" {
 		return true
@@ -606,6 +638,103 @@ func compatHasAssistantReasoningHistory(body []byte) bool {
 		}
 	}
 	return false
+}
+
+func compatReasoningSessionKey(meta map[string]any, model string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.SessionAffinityMetadataKey]
+	if !ok {
+		return ""
+	}
+	sessionKey := strings.TrimSpace(fmt.Sprint(raw))
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if sessionKey == "" || model == "" {
+		return ""
+	}
+	return sessionKey + "|" + model
+}
+
+func compatReasoningLookup(key string) string {
+	if key == "" {
+		return ""
+	}
+	raw, ok := compatReasoningHistoryCache.Load(key)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(raw))
+}
+
+func compatReasoningRemember(key string, reasoning string) {
+	if key == "" {
+		return
+	}
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" || reasoning == "[reasoning unavailable]" {
+		return
+	}
+	compatReasoningHistoryCache.Store(key, reasoning)
+}
+
+func compatReasoningAppend(key string, reasoning string) {
+	if key == "" {
+		return
+	}
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" || reasoning == "[reasoning unavailable]" {
+		return
+	}
+	if existing := compatReasoningLookup(key); existing != "" {
+		compatReasoningHistoryCache.Store(key, existing+reasoning)
+		return
+	}
+	compatReasoningHistoryCache.Store(key, reasoning)
+}
+
+func extractLatestReasoningContent(payload []byte, stream bool) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if stream {
+		line := strings.TrimSpace(string(payload))
+		if !strings.HasPrefix(line, "data:") {
+			return ""
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" || !gjson.Valid(data) {
+			return ""
+		}
+		choices := gjson.Get(data, "choices")
+		if !choices.Exists() || !choices.IsArray() {
+			return ""
+		}
+		latest := ""
+		for _, choice := range choices.Array() {
+			if text := strings.TrimSpace(choice.Get("delta.reasoning_content").String()); text != "" {
+				latest += text
+			}
+			if text := strings.TrimSpace(choice.Get("message.reasoning_content").String()); text != "" {
+				latest = text
+			}
+		}
+		return strings.TrimSpace(latest)
+	}
+	if !gjson.ValidBytes(payload) {
+		return ""
+	}
+	choices := gjson.GetBytes(payload, "choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return ""
+	}
+	latest := ""
+	for _, choice := range choices.Array() {
+		if text := strings.TrimSpace(choice.Get("message.reasoning_content").String()); text != "" {
+			latest = text
+		}
+	}
+	return latest
 }
 
 func shouldNormalizeKimiCompatPayload(model string) bool {
